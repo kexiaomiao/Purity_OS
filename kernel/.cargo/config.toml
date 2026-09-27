@@ -1,0 +1,6 @@
+[unstable]
+# Build core/alloc/compiler-builtins from source for the bare-metal kernel.
+# This config only applies when cargo is invoked from the kernel/ directory
+# (i.e. when xtask builds the kernel). The host-side xtask does not use it.
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

@@ -1,0 +1,28 @@
+[package]
+name = "purity_os"
+version = "0.1.0"
+edition = "2021"
+authors = ["PurityOS"]
+description = "PurityOS - a pure Rust from-scratch kernel operating system"
+
+# The `bootloader` crate provides a precompiled BIOS bootloader that hands
+# control to the kernel in 64-bit long mode with paging already enabled.
+[dependencies]
+bootloader_api = "0.11"
+x86_64 = "0.15"
+pic8259 = "0.11"
+spin = "0.9"
+uart_16550 = "0.2"
+linked_list_allocator = "0.10.5"
+micromath = "2"
+
+[profile.dev]
+panic = "abort"
+# Less optimization => faster kernel builds.
+debug-assertions = true
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+# `build.rs` compiles the Ring 3 user program (no extra dependencies needed).

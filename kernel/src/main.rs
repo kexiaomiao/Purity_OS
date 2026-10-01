@@ -43,46 +43,42 @@ const BOOT_CONFIG: bootloader_api::BootloaderConfig = {
 
 entry_point!(kernel_main, config = &BOOT_CONFIG);
 
-fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
-    // Lock-free earliest possible proof-of-life: program COM1 directly and
-    // print before any globals/locks/paging setup that could itself fault.
-    unsafe {
-        drivers::uart::early_init();
-        drivers::uart::early_print("[kernel] entry reached\n");
-        drivers::uart::early_print("[kernel] stage: uart::init\n");
-    }
+/// A dedicated kernel stack is not needed: the bootloader's boot stack is
+/// fine, but its top sits flush against an unmapped page and generated code
+/// writes at positive RSP offsets near the top. We map writable headroom above
+/// it right after paging is set up (see `mem::map_headroom_writable`).
 
+fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // Earliest output paths.
     drivers::uart::init();
     // NOTE: do NOT touch the VGA text buffer at 0xb8000 yet — the bootloader
     // may not have mapped it into kernel space, and GDT/IDT aren't installed
     // yet, so a page fault here would triple-fault with no handler. The GUI
     // framebuffer takes over later; VGA output is only used as a fallback.
-    unsafe { drivers::uart::early_print("[kernel] stage: gdt init\n"); }
     interrupts::gdt::init();
-    unsafe { drivers::uart::early_print("[kernel] stage: idt init\n"); }
     interrupts::idt::init();
-    unsafe { drivers::uart::early_print("[kernel] stage: pic init\n"); }
     interrupts::pic::init();
-    unsafe { drivers::uart::early_print("[kernel] stage: timer/rtc init\n"); }
     drivers::timer::init();
     drivers::rtc::init();
-    unsafe { drivers::uart::early_print("[kernel] stage: mem init\n"); }
     crate::klog!("PurityOS kernel starting...\n");
 
     // Memory + heap (must come before anything that allocates). We first pull
     // the framebuffer out of the boot info so both subsystems can be set up.
     let fbuf = boot_info.framebuffer.take();
     mem::init(boot_info);
-    unsafe { drivers::uart::early_print("[kernel] stage: interrupts enable\n"); }
+    // The boot stack top sits flush against an unmapped page; map writable
+    // headroom above it so kernel_main's positive-RSP-offset writes survive.
+    mem::map_headroom_writable(0x1000_0000_0000, 256 * 1024);
+
+    // Restore PurityFS from the ATA disk. This must run BEFORE the scheduler
+    // starts (task::init), while interrupts are still off and the PIT has no
+    // chance to switch stacks. The reader is bounded: it probes LBA 100 for the
+    // PFS1 superblock magic and reads at most 32 sectors (16 KiB), and returns
+    // immediately on an empty disk without allocating.
+    fs::load_from_disk();
 
     // Keyboard + timer interrupts now live.
     x86_64::instructions::interrupts::enable();
-
-    // NOTE: fs::load_from_disk() runs *later*, from the idle task. Calling it
-    // here (before the scheduler exists) was double-faulting: the first PIT
-    // interrupt after the ATA poll hit a not-yet-fully-live scheduler context.
-    // Once the scheduler is up, the idle task loads the disk-backed FS safely.
 
     // GUI: framebuffer + mouse + window manager + desktop.
     let gui_on = gui::start(fbuf);
@@ -95,8 +91,13 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     crate::println!("PurityOS kernel ready.");
     crate::klog!("PurityOS kernel ready.\n");
 
-    // Start the scheduler; the shell runs as task #1. This returns to us
-    // (as the idle task) only when multitasking is up.
+    // --- Automated Ring-3 link test: preload keyboard input BEFORE the
+    // scheduler starts, so the user shell can read it without real hardware.
+    // "echo test" then "fork" (execs /bin/forktest which calls SYS_GETPID and
+    // SYS_FORK and prints the parent/child branches).
+    crate::drivers::keyboard::preload(b"echo test\nfork\n");
+
+    // Start the scheduler; the shell runs as task #1. This never returns.
     task::init(shell::run);
 }
 

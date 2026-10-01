@@ -73,6 +73,14 @@ pub fn run() -> ! {
     println!("Welcome to PurityOS. Type `help` for a list of commands.");
     println!("Tab completes commands; Up/Down recall history.\n");
 
+    // Automated boot test: drop into the user-mode Ring 3 shell, which reads
+    // the preloaded keyboard bytes ("echo test", "hi").
+    crate::klog!("[test] launching user shell\n");
+    match crate::user::run_user_shell() {
+        Ok(()) => crate::klog!("[test] user shell returned\n"),
+        Err(e) => crate::klog!("[test] user shell failed: {}\n", e),
+    }
+
     main_loop()
 }
 

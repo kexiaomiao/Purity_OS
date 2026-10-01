@@ -2,6 +2,7 @@
 
 use pic8259::ChainedPics;
 use spin::Mutex;
+use x86_64::instructions::port::Port;
 
 pub const PIC_1_OFFSET: u8 = 0x20;
 pub const PIC_2_OFFSET: u8 = 0x28;
@@ -30,6 +31,19 @@ impl InterruptIndex {
 /// Initialize (remap) the PICs.
 pub fn init() {
     unsafe { PICS.lock().initialize() };
+    // Mask every IRQ except the ones we actually service. The ATA disk
+    // (IRQ14) asserts its line even in PIO polling mode; without a handler and
+    // EOI it corrupts interrupt delivery the moment interrupts are enabled,
+    // producing a double fault. Blocking it (and all other unserviced IRQs)
+    // keeps the interrupt controller quiet until we install real handlers.
+    unsafe {
+        // PIC1 data (0x21): enable IRQ0 (timer), IRQ1 (keyboard), IRQ2
+        // (cascade). Mask IRQ3..IRQ7 (serial etc.).
+        Port::new(0x21u16).write(0xF8u8);
+        // PIC2 data (0xA1): enable IRQ12 (mouse). Mask IRQ8..11, IRQ13..15,
+        // including IRQ14 (ATA) and IRQ15 (secondary ATA).
+        Port::new(0xA1u16).write(0xEFu8);
+    }
 }
 
 /// Send end-of-interrupt to the PIC.

@@ -40,6 +40,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
 
     // Software interrupt gate, DPL=3: user programs call `int 0x80`.
+    // Interrupt gate (IF cleared on entry): the syscall runs atomically and is
+    // never preempted by the PIT. The resumed task's IF is guaranteed by
+    // `PurityOS_switch` issuing `sti` on resume (see task.rs).
     idt[SYSCALL_VECTOR]
         .set_handler_fn(syscall_handler)
         .set_privilege_level(PrivilegeLevel::Ring3);
@@ -204,11 +207,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack: InterruptStackFrame) {
     crate::drivers::timer::tick();
     crate::interrupts::pic::notify_eoi(InterruptIndex::Timer);
 
-    // Wake sleeping tasks in any mode.
+    // Wake any tasks blocked on input, then (if we were not in user mode)
+    // round-robin switch to the next task. In user mode we deliberately do NOT
+    // switch here — the preempted task resumes and the scheduler gives each
+    // task its slice via its own voluntary yields.
     crate::task::wake_blocked();
-
-    // Preempt only while running kernel (Ring 0) tasks. A user program owns
-    // the CPU until it traps back via int 0x80 or exits.
     if !in_user_mode(&stack) {
         crate::task::switch_to_next();
     }
@@ -238,32 +241,77 @@ pub mod syscall_numbers {
     pub const SYS_STAT: u64 = 8;
     pub const SYS_GETPID: u64 = 9;
     pub const SYS_KILL: u64 = 10;
+    pub const SYS_EXEC: u64 = 11;
+    pub const SYS_WAIT: u64 = 12;
+    pub const SYS_FORK: u64 = 13;
 }
 
 extern "x86-interrupt" fn syscall_handler(mut stack: InterruptStackFrame) {
-    // Read syscall number (rax) and args (rdi, rsi, rdx) in one asm block.
-    // Each output is pinned to the register it reads so LLVM's allocator
-    // cannot clobber a source before it is read (a real bug we hit: `out(reg)`
-    // let LLVM chain outputs through rdi→rsi→rdx→rcx).
-    let (n, a, b, c): (u64, u64, u64, u64);
+    // Snapshot the syscall number + args. rax is read with a *separate* lateout
+    // whose result is passed to dispatch by value — exactly the pattern that
+    // keeps rax out of the interrupt ABI's restore set, so the return write-back
+    // below survives the epilogue.
+    let mut n: u64 = 0;
+    let mut a: u64 = 0;
+    let mut b: u64 = 0;
+    let mut c: u64 = 0;
     unsafe {
-        // Snapshot rax/rdi/rsi/rdx (user's syscall number + args).
         core::arch::asm!(
             "",
-            lateout("rax") n, lateout("rdi") a, lateout("rsi") b, lateout("rdx") c,
+            lateout("rax") n,
+            lateout("rdi") a,
+            lateout("rsi") b,
+            lateout("rdx") c,
             options(nomem, nostack, preserves_flags),
         );
     }
 
-    let ret = crate::user::syscall::dispatch(n, a, b, c, &mut stack);
+    // Snapshot the rest of the user's GP registers for fork. rax is left 0
+    // (a child's fork() returns 0 anyway); rbx/rbp/r12-r15 are left 0 too — a
+    // forked child reloads them from its own (cloned) stack in the caller's
+    // prologue, exactly like the parent. Crucially, `regs` must NOT contain the
+    // syscall number: passing `&regs` to dispatch would keep rax live across
+    // the call and force the ABI to restore it, clobbering our return value.
+    let mut regs = crate::user::SavedRegs {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+    };
+    unsafe {
+        core::arch::asm!(
+            "",
+            lateout("rcx") regs.rcx,
+            lateout("rsi") regs.rsi,
+            lateout("rdi") regs.rdi,
+            lateout("r8") regs.r8,
+            lateout("r9") regs.r9,
+            lateout("r10") regs.r10,
+            lateout("r11") regs.r11,
+            lateout("r12") regs.r12,
+            lateout("r13") regs.r13,
+            lateout("r14") regs.r14,
+            lateout("r15") regs.r15,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
 
-    // Write the return value into RAX; data dependency (ret derives from the
-    // register reads above) keeps the asm blocks ordered.
+    let ret = crate::user::syscall::dispatch(n, a, b, c, &regs, &mut stack);
+
+    // Deliver the return value in rax. The x86-interrupt epilogue *always*
+    // restores all 15 GPRs before iretq, so rax is clobbered by its `pop rax`
+    // after any bare `mov rax, ret`. The ABI pushes the saved GPRs directly
+    // below the InterruptStackFrame; rax (pushed last) is at frame_ptr - 0x78.
+    // Writing ret there makes the epilogue's `pop rax` restore our return value
+    // into the user's rax. (Keeping `mov rax, ret` too pins the 15-register
+    // layout so the offset below stays valid.)
     unsafe {
         core::arch::asm!(
             "mov rax, {}",
             in(reg) ret,
             options(nomem, nostack, preserves_flags),
         );
+        let slot = (&stack as *const InterruptStackFrame as *mut u64).offset(-15);
+        // Volatile so LLVM cannot treat this as a dead store or reorder it:
+        // it must land before the epilogue's `pop rax` reads this slot.
+        unsafe { slot.write_volatile(ret); }
     }
 }

@@ -115,6 +115,21 @@ impl VirtualFs {
             "/home/current".into(),
             mk(FileKind::SymLink, b"", "/home/docs/readme.md", 8),
         );
+        // /bin holds executable programs. The seeded Ring-3 "hello" ELF lives
+        // here; once disk persistence is wired, the on-disk copy overrides this.
+        entries.insert("/bin".into(), mk(FileKind::Dir, b"", "", 9));
+        entries.insert(
+            "/bin/hello".into(),
+            mk(FileKind::File, crate::user::user_elf_seed(), "", 10),
+        );
+        entries.insert(
+            "/bin/shell".into(),
+            mk(FileKind::File, crate::user::user_shell_seed(), "", 11),
+        );
+        entries.insert(
+            "/bin/forktest".into(),
+            mk(FileKind::File, crate::user::user_forktest_seed(), "", 12),
+        );
         VirtualFs { cwd: "/home".into(), entries }
     }
 
@@ -488,16 +503,19 @@ pub fn flush_to_disk() {
 /// Memory-safe: we read the superblock first, then only allocate as many
 /// sectors as the on-disk image actually needs (hard cap 32 sectors = 16 KiB),
 /// so a blank or corrupt disk can never balloon our 256 KiB heap.
-pub fn load_from_disk() {
+///
+/// Returns `true` if a valid on-disk image was loaded, `false` if we fell back
+/// to the default in-memory tree (fresh disk / ATA unavailable / corrupt).
+pub fn load_from_disk() -> bool {
     let mut superblock = [0u8; 512];
     // First probe: read the superblock sector.
     if let Err(e) = crate::drivers::ata::read_sector(PFS_LBA, &mut superblock) {
         crate::klog!("[fs] ATA not available ({}), keeping in-memory FS\n", e);
-        return;
+        return false;
     }
     if &superblock[0..4] != PFS_MAGIC {
         crate::klog!("[fs] no PurityFS signature on disk, fresh FS\n");
-        return;
+        return false;
     }
 
     // The on-disk format begins: magic(4) | entry_count(4) | entries...
@@ -505,7 +523,7 @@ pub fn load_from_disk() {
     let on_disk_count = u32::from_le_bytes(superblock[4..8].try_into().unwrap()) as usize;
     if on_disk_count == 0 || on_disk_count > 4096 {
         crate::klog!("[fs] implausible entry count {}, fresh FS\n", on_disk_count);
-        return;
+        return false;
     }
 
     // Conservative worst-case image size: each entry needs at least ~14 bytes
@@ -534,7 +552,9 @@ pub fn load_from_disk() {
         let n = vfs.entries.len();
         *FS.lock() = vfs;
         crate::klog!("[fs] loaded {} entries from disk ({} sectors)\n", n, sectors_needed);
+        true
     } else {
         crate::klog!("[fs] disk image corrupt, keeping defaults\n");
+        false
     }
 }

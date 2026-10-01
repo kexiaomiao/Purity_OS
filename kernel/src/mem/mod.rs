@@ -12,7 +12,7 @@ use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
-    Size4KiB,
+    Size4KiB, Translate,
 };
 use x86_64::PhysAddr;
 
@@ -130,6 +130,33 @@ fn map_heap(
     }
 }
 
+/// Map the boot stack region plus generous headroom ABOVE its top as writable.
+///
+/// The bootloader places the kernel boot stack flush against an unmapped page,
+/// and code generated for `kernel_main` (which is `!` and never returns) writes
+/// at positive offsets from RSP near the top. Without mapped headroom that
+/// write faults and double-faults. This maps `[start, start+bytes)` writable,
+/// skipping pages that are already mapped (e.g. the boot stack itself).
+pub fn map_headroom_writable(start: u64, bytes: usize) {
+    let mut mapper = unsafe { mapper() };
+    let mut fa = unsafe { BootInfoFrameAllocator::new() };
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let first = Page::containing_address(VirtAddr::new(start));
+    let last = Page::containing_address(VirtAddr::new(start + bytes as u64 - 1));
+    for page in Page::range_inclusive(first, last) {
+        if mapper.translate_addr(page.start_address()).is_some() {
+            continue; // already mapped (e.g. the boot stack page)
+        }
+        let frame = fa.allocate_frame().expect("OOM mapping stack headroom");
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, &mut fa)
+                .expect("failed to map stack headroom page")
+                .flush();
+        }
+    }
+}
+
 /// Map the virtual range `[vaddr, vaddr+len)` as **user-accessible** pages.
 ///
 /// `writable` controls the U/W bit. The kernel's own pages (heap, code, data)
@@ -138,10 +165,10 @@ pub fn map_user_pages(vaddr: usize, len: usize, writable: bool) -> Result<(), &'
     if len == 0 {
         return Ok(());
     }
-    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if writable {
-        flags |= PageTableFlags::WRITABLE;
-    }
+    // User pages are mapped writable for now (the kernel needs to zero/copy
+    // into them; read-only protection per ELF segment is a later hardening).
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+    let _ = writable;
 
     let mut mapper = unsafe { mapper() };
     let mut frame_allocator = unsafe { BootInfoFrameAllocator::new() };
@@ -152,6 +179,13 @@ pub fn map_user_pages(vaddr: usize, len: usize, writable: bool) -> Result<(), &'
     let mut mapped: alloc::vec::Vec<Page> = alloc::vec::Vec::new();
     let result = (|| -> Result<(), &'static str> {
         for page in Page::range_inclusive(start, end) {
+            // Re-map: if this page is already present (e.g. SYS_EXEC loading a
+            // new ELF at the same link address), unmap the old frame first.
+            if mapper.translate_page(page).is_ok() {
+                if let Ok((_frame, flush)) = unsafe { mapper.unmap(page) } {
+                    flush.flush();
+                }
+            }
             let frame = frame_allocator
                 .allocate_frame()
                 .ok_or("out of physical memory")?;
@@ -306,5 +340,124 @@ pub fn phys_stats() -> u64 {
             .map(|r| r.end - r.start)
             .sum(),
         None => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fork: deep-copy the current address space into an independent page table
+// ---------------------------------------------------------------------------
+
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::page_table::PageTableEntry;
+
+unsafe fn page_table_at<'a>(phys: x86_64::PhysAddr, off: VirtAddr) -> &'a PageTable {
+    &*(off + phys.as_u64()).as_ptr::<PageTable>()
+}
+unsafe fn page_table_mut_at<'a>(phys: x86_64::PhysAddr, off: VirtAddr) -> &'a mut PageTable {
+    &mut *(off + phys.as_u64()).as_mut_ptr::<PageTable>()
+}
+
+unsafe fn copy_frame_content(src: PhysFrame, dst: PhysFrame, off: VirtAddr) {
+    let s = (off + src.start_address().as_u64()).as_ptr::<u8>();
+    let d = (off + dst.start_address().as_u64()).as_mut_ptr::<u8>();
+    core::ptr::copy_nonoverlapping(s, d, 4096);
+}
+
+/// Does the subtree rooted at `entry` (at the given paging level) contain any
+/// user-accessible leaf page? Used to decide whether a fork must clone it.
+fn subtree_is_user(entry: &PageTableEntry, level: u8, off: VirtAddr) -> bool {
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return false;
+    }
+    if level == 1 {
+        return entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    }
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    }
+    let table = unsafe { page_table_at(entry.addr(), off) };
+    for i in 0..512 {
+        if subtree_is_user(&table[i], level - 1, off) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursively clone every user-accessible page of `parent` into `child`,
+/// allocating fresh frames for the user data and fresh page tables for the
+/// user subtree. Non-user entries are left shared (kernel half).
+fn clone_level(
+    parent: &PageTable,
+    child: &mut PageTable,
+    level: u8,
+    off: VirtAddr,
+    fa: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), &'static str> {
+    for i in 0..512 {
+        let pe = &parent[i];
+        if !pe.flags().contains(PageTableFlags::PRESENT) {
+            continue; // hole already copied (child[i] == 0)
+        }
+        if level == 1 {
+            // Leaf: clone the physical frame's contents.
+            let src_frame = unsafe { PhysFrame::from_start_address_unchecked(pe.addr()) };
+            let dst_frame = fa.allocate_frame().ok_or("fork: OOM leaf")?;
+            unsafe { copy_frame_content(src_frame, dst_frame, off) };
+            let mut e = PageTableEntry::new();
+            e.set_frame(dst_frame, pe.flags());
+            child[i] = e;
+        } else if unsafe { subtree_is_user(&pe, level, off) } {
+            // User subtree: allocate a fresh page table and clone below.
+            let new_frame = fa.allocate_frame().ok_or("fork: OOM subtree")?;
+            let new_phys = new_frame.start_address();
+            unsafe {
+                let new_table = page_table_mut_at(new_phys, off);
+                new_table.zero();
+                let old_table = page_table_at(pe.addr(), off);
+                clone_level(old_table, new_table, level - 1, off, fa)?;
+            }
+            let mut e = PageTableEntry::new();
+            e.set_frame(new_frame, pe.flags());
+            child[i] = e;
+        }
+        // else: non-user subtree already shared (child[i] == parent[i]).
+    }
+    Ok(())
+}
+
+/// Deep-copy the current (parent) user-accessible pages into a fresh,
+/// independent address space. Returns the physical address of the new Level-4
+/// page-table root. The child shares the kernel half but has a private copy of
+/// every user page, so it can run concurrently with the parent.
+pub fn fork_user_space() -> Result<u64, &'static str> {
+    let off = VirtAddr::new(PHYS_OFFSET.load(Ordering::SeqCst));
+    let (parent_l4_frame, _) = Cr3::read();
+    let parent_l4_phys = parent_l4_frame.start_address();
+    let mut fa = unsafe { BootInfoFrameAllocator::new() };
+
+    // Fresh L4, seeded with a copy of the parent's entries (shares kernel
+    // half and page-table frames until we clone the user subtrees).
+    let child_l4_frame = fa.allocate_frame().ok_or("fork: OOM L4")?;
+    let child_l4_phys = child_l4_frame.start_address();
+    let (parent_l4, child_l4) = unsafe {
+        (page_table_at(parent_l4_phys, off), page_table_mut_at(child_l4_phys, off))
+    };
+    child_l4.zero();
+    for i in 0..512 {
+        child_l4[i] = parent_l4[i].clone();
+    }
+    clone_level(parent_l4, child_l4, 4, off, &mut fa)?;
+    Ok(child_l4_phys.as_u64())
+}
+
+/// Load the given physical Level-4 page table root into CR3.
+pub fn switch_cr3(cr3: u64) {
+    use x86_64::registers::control::Cr3;
+    unsafe {
+        Cr3::write(
+            PhysFrame::containing_address(x86_64::PhysAddr::new(cr3)),
+            x86_64::registers::control::Cr3Flags::empty(),
+        );
     }
 }

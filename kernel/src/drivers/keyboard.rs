@@ -17,19 +17,34 @@ pub const KEY_RIGHT: u8 = 0x83;
 
 /// Buffered ASCII input; the shell reads from here.
 static BUFFER: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+/// Pre-injected bytes used for automated boot testing (no QEMU keyboard needed).
+static PRELOAD: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 /// Tracks the E0 prefix (arrow keys / extended keys).
 static EXTENDED: Mutex<bool> = Mutex::new(false);
 /// Number of shift keys (left+right) currently held, so releasing one while
 /// the other is still held keeps Shift active.
 static SHIFT: AtomicUsize = AtomicUsize::new(0);
 
-/// Number of bytes waiting.
+/// Push bytes into the preload queue; they are consumed before real hardware.
+pub fn preload(bytes: &[u8]) {
+    let mut p = PRELOAD.lock();
+    for &b in bytes {
+        p.push_back(b);
+    }
+}
+
+/// Number of bytes waiting (preload queue first, then hardware buffer).
 pub fn available() -> usize {
-    BUFFER.lock().len()
+    let p = PRELOAD.lock().len();
+    if p > 0 { p } else { BUFFER.lock().len() }
 }
 
 /// Pop one byte from the keyboard buffer, if any.
 pub fn read() -> Option<u8> {
+    let mut p = PRELOAD.lock();
+    if let Some(b) = p.pop_front() {
+        return Some(b);
+    }
     BUFFER.lock().pop_front()
 }
 
@@ -98,6 +113,9 @@ pub fn handle_irq() {
             BUFFER.lock().push_back(ascii);
         }
     }
+
+    // Wake any task blocked on SYS_READ (keyboard stdin).
+    crate::task::wake_keyboard_waiters();
 }
 
 /// Translate a set-1 make code to ASCII, honoring the Shift modifier.

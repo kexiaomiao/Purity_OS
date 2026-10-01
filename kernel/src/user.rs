@@ -9,8 +9,24 @@ use x86_64::structures::idt::InterruptStackFrame;
 use crate::interrupts::gdt;
 use crate::mem;
 
-/// The embedded user program ELF.
-static USER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"));
+/// The seeded Ring-3 "hello" ELF, baked into the kernel image at build time.
+///
+/// At runtime it is exposed as the file `/bin/hello` in PurityFS; the ELF
+/// loader reads it through the filesystem, not through this symbol directly.
+/// Once disk persistence is live, an on-disk `/bin/hello` overrides this seed.
+pub fn user_elf_seed() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"))
+}
+
+/// The seeded Ring-3 user shell ELF, baked into the kernel image at build time.
+pub fn user_shell_seed() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"))
+}
+
+/// The seeded Ring-3 fork-test ELF, baked into the kernel image at build time.
+pub fn user_forktest_seed() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/user_forktest.elf"))
+}
 
 /// User stack size; its virtual address is chosen automatically by
 /// `mem::alloc_user_region` (no hard-coded addresses).
@@ -36,9 +52,9 @@ fn rd_u64(d: &[u8], o: usize) -> u64 {
     ])
 }
 
-/// Load the embedded ELF into user pages and jump to it (never returns).
-pub fn run_user_program() -> Result<(), &'static str> {
-    let elf: &[u8] = USER_ELF;
+/// Validate an ELF, map its PT_LOAD segments into user pages, allocate a fresh
+/// user stack, and return (entry_point, stack_top). Does not itself enter Ring 3.
+pub fn load_elf_into_user(elf: &[u8]) -> Result<(u64, u64), &'static str> {
     if elf.len() < 64 {
         return Err("ELF file too small");
     }
@@ -96,13 +112,28 @@ pub fn run_user_program() -> Result<(), &'static str> {
     let stack_base = mem::alloc_user_region(USER_STACK_SIZE / 4096, true)
         .ok_or("no user stack available")?;
     mem::zero_pages(stack_base, USER_STACK_SIZE);
+    Ok((e_entry, (stack_base + USER_STACK_SIZE) as u64))
+}
 
-    crate::println!("[kernel] loading user program: entry={:#x}, stack={:#x}",
-        e_entry, stack_base + USER_STACK_SIZE);
+/// Load the ELF at `/bin/hello` from PurityFS into user pages and jump to it
+/// (never returns). The ELF bytes come from the filesystem, not from a
+/// statically-linked symbol — so a disk-backed `/bin/hello` replaces the seed.
+pub fn run_user_program() -> Result<(), &'static str> {
+    let elf: alloc::vec::Vec<u8> =
+        crate::fs::with(|vfs| vfs.read_file("/bin/hello")).ok_or("no /bin/hello")?;
+    let (e_entry, stack_top) = load_elf_into_user(&elf)?;
     crate::klog!("[kernel] jumping to Ring 3, entry {:#x}\n", e_entry);
-
     // irretq into user mode — never returns.
-    unsafe { jump_user(e_entry, (stack_base + USER_STACK_SIZE) as u64) }
+    unsafe { jump_user(e_entry, stack_top) }
+}
+
+/// Load `/bin/shell` (the user-mode shell) and jump into it. Never returns.
+pub fn run_user_shell() -> Result<(), &'static str> {
+    let elf: alloc::vec::Vec<u8> =
+        crate::fs::with(|vfs| vfs.read_file("/bin/shell")).ok_or("no /bin/shell")?;
+    let (e_entry, stack_top) = load_elf_into_user(&elf)?;
+    crate::klog!("[kernel] jumping to user shell, entry {:#x}\n", e_entry);
+    unsafe { jump_user(e_entry, stack_top) }
 }
 
 /// Construct an interrupt-return frame on the stack and execute `iretq`.
@@ -149,7 +180,10 @@ pub(crate) fn recover_user_fault(stack: &mut InterruptStackFrame, what: &str) {
     fv.code_segment = gdt::kernel_code();
     fv.stack_segment = gdt::kernel_data();
     fv.stack_pointer = VirtAddr::new(ret_stack_top);
-    // cpu_flags left as-is (IF already set)
+    // Force IF=1 so the resumed kernel shell can hlt() and be woken by the
+    // PIT. (The syscall gate is a trap gate that preserves IF, but be explicit
+    // so this also holds if the path is ever reached via an interrupt gate.)
+    fv.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(fv.cpu_flags.bits() | 0x200); // RFLAGS.IF
     unsafe { stack.as_mut().write(fv) };
 }
 
@@ -160,6 +194,92 @@ extern "C" fn kernel_resume() -> ! {
     crate::shell::main_loop();
 }
 
+// ---- Ring 3 process context (for fork) ----
+
+/// Full user-mode register state of a process. Used by `fork` to create a
+/// child that resumes with a copy of the parent's registers (rax = 0).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserContext {
+    pub rax: u64, pub rbx: u64, pub rcx: u64, pub rdx: u64,
+    pub rsi: u64, pub rdi: u64, pub rbp: u64,
+    pub r8: u64, pub r9: u64, pub r10: u64, pub r11: u64,
+    pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+    pub rip: u64, pub cs: u64, pub rflags: u64, pub rsp: u64, pub ss: u64,
+}
+
+/// The general-purpose registers of a user program at syscall entry.
+#[derive(Clone, Copy)]
+pub struct SavedRegs {
+    pub rax: u64, pub rbx: u64, pub rcx: u64, pub rdx: u64,
+    pub rsi: u64, pub rdi: u64, pub rbp: u64,
+    pub r8: u64, pub r9: u64, pub r10: u64, pub r11: u64,
+    pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+}
+
+impl UserContext {
+    /// Build a full user context from the syscall-time registers plus the
+    /// interrupt frame (RIP/CS/RFLAGS/RSP/SS pushed by the CPU on int 0x80).
+    pub fn from(regs: &SavedRegs, frame: &InterruptStackFrame) -> UserContext {
+        UserContext {
+            rax: regs.rax, rbx: regs.rbx, rcx: regs.rcx, rdx: regs.rdx,
+            rsi: regs.rsi, rdi: regs.rdi, rbp: regs.rbp,
+            r8: regs.r8, r9: regs.r9, r10: regs.r10, r11: regs.r11,
+            r12: regs.r12, r13: regs.r13, r14: regs.r14, r15: regs.r15,
+            rip: frame.instruction_pointer.as_u64(),
+            cs: frame.code_segment.0 as u64,
+            rflags: frame.cpu_flags.bits(),
+            rsp: frame.stack_pointer.as_u64(),
+            ss: frame.stack_segment.0 as u64,
+        }
+    }
+}
+
+/// Jump into Ring 3 using a previously captured `UserContext`. The child
+/// process's first entry (after fork) lands here. `ctx` is passed in RDI.
+/// Jump into Ring 3 using a previously captured `UserContext`. The child
+/// process's first entry (after fork) lands here. `ctx` is passed in RDI.
+/// Callee-saved registers (rbx/rbp/r12-r15) are deliberately not restored
+/// here: the child resumes inside the fork() wrapper, and its caller reloads
+/// them from its own (cloned) stack frame, exactly like the parent.
+#[inline(never)]
+unsafe fn jump_user_from_ctx(ctx: *const UserContext) -> ! {
+    core::arch::asm!(
+        // ctx is in rdi. Push the iretq frame (SS,RSP,RFLAGS,CS,RIP) first,
+        // using rax as scratch.
+        "mov rax, [rdi+152]",   // ss
+        "push rax",
+        "mov rax, [rdi+144]",   // rsp
+        "push rax",
+        "mov rax, [rdi+136]",   // rflags
+        "push rax",
+        "mov rax, [rdi+128]",   // cs
+        "push rax",
+        "mov rax, [rdi+120]",   // rip
+        "push rax",
+        // Load the caller-saved GP registers from the context.
+        "mov rcx, [rdi+16]",
+        "mov rdx, [rdi+24]",
+        "mov rsi, [rdi+32]",
+        "mov r8, [rdi+56]",
+        "mov r9, [rdi+64]",
+        "mov r10, [rdi+72]",
+        "mov r11, [rdi+80]",
+        "mov rax, [rdi+0]",     // user rax (0 for a forked child)
+        "mov rdi, [rdi+40]",    // user rdi, read last (rdi is the ctx base)
+        "iretq",
+        options(noreturn),
+    );
+}
+
+/// Enter Ring 3 at the given context. Used by `task::process_enter` when a
+/// forked child task is first scheduled. `#[inline(never)]` keeps the RDI =
+/// ctx pointer ABI contract intact (inlining was miscompiling it).
+#[inline(never)]
+pub(crate) unsafe fn enter_user_from_ctx(ctx: *const UserContext) -> ! {
+    jump_user_from_ctx(ctx)
+}
+
 // ---- System call dispatch ----
 
 pub mod syscall {
@@ -167,11 +287,13 @@ pub mod syscall {
     use alloc::string::String;
     use alloc::vec::Vec;
     use x86_64::structures::idt::InterruptStackFrame;
+    use x86_64::VirtAddr;
 
     use crate::interrupts::idt::syscall_numbers::{
-        SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_READ, SYS_SLEEP, SYS_STAT,
-        SYS_WRITE, SYS_WRITE_FD,
+        SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_READ,
+        SYS_SLEEP, SYS_STAT, SYS_WAIT, SYS_WRITE, SYS_WRITE_FD,
     };
+    use crate::user::{SavedRegs, UserContext};
 
     // User ELF is linked at 0x400000; user heap/stack live below 0x70000000.
     const USER_LO: u64 = 0x0040_0000;
@@ -241,12 +363,14 @@ pub mod syscall {
         FDS.lock()
     }
 
-    /// Dispatch an `int 0x80` call. `a`/`b`/`c` are the user's rdi/rsi/rdx.
+    /// Dispatch an `int 0x80` call. `a`/`b`/`c` are the user's rdi/rsi/rdx;
+    /// `regs` is the full user GP register snapshot (needed by fork).
     pub fn dispatch(
         n: u64,
         a: u64,
         b: u64,
         c: u64,
+        regs: &SavedRegs,
         stack: &mut InterruptStackFrame,
     ) -> u64 {
         match n {
@@ -256,6 +380,8 @@ pub mod syscall {
                 let Some(bytes) = copy_in(a, len) else { return 0 };
                 let s = core::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
                 crate::print!("{}", s);
+                // Mirror to serial for automated boot testing (fb isn't captured).
+                unsafe { crate::drivers::uart::early_print(s); }
                 bytes.len() as u64
             }
             SYS_READ => {
@@ -264,9 +390,10 @@ pub mod syscall {
                 let count = (c as usize).min(MAX_IO);
                 let mut tmp = [0u8; MAX_IO];
                 let got = if fd == 0 {
-                    // Block (hlt) until at least one key is available.
+                    // Block on the scheduler (not busy-spin hlt) until a key
+                    // lands; the keyboard IRQ wakes us.
                     while crate::drivers::keyboard::available() == 0 {
-                        x86_64::instructions::hlt();
+                        crate::task::block_on_keyboard();
                     }
                     let mut n = 0;
                     while n < count {
@@ -274,6 +401,8 @@ pub mod syscall {
                             Some(k) => {
                                 tmp[n] = k;
                                 n += 1;
+                                // Line-buffered: stop at newline.
+                                if k == b'\n' { break; }
                             }
                             None => break,
                         }
@@ -351,7 +480,18 @@ pub mod syscall {
                 out[12..16].copy_from_slice(&mode.to_le_bytes());
                 if copy_out(b, &out) { 1 } else { 0 }
             }
-            SYS_GETPID => 1,
+            SYS_GETPID => crate::task::current_pid() as u64,
+            SYS_FORK => {
+                // Deep-copy the parent's user memory into an independent page
+                // table and create a child task. The child resumes with the
+                // parent's registers but rax = 0; the parent returns the child
+                // pid from fork.
+                let ctx = UserContext::from(regs, stack);
+                match crate::task::fork_process(ctx) {
+                    Some(pid) => pid as u64,
+                    None => u64::MAX,
+                }
+            }
             SYS_KILL => {
                 // a = pid to kill. Killing pid 0 (idle) is refused.
                 if a == 0 {
@@ -363,12 +503,56 @@ pub mod syscall {
                 }
             }
             SYS_EXIT => {
-                super::recover_user_fault(stack, "exit");
+                if crate::task::current_is_process() {
+                    // A forked child terminates itself (never returns).
+                    crate::task::exit_current();
+                } else {
+                    // The shell's own user program returns to the kernel shell.
+                    super::recover_user_fault(stack, "exit");
+                }
                 0
             }
             SYS_SLEEP => {
                 // Block this task and yield the CPU; other tasks keep running.
                 crate::task::sleep_ms(a);
+                0
+            }
+            SYS_EXEC => {
+                // a = path ptr. Load the ELF from PurityFS, map it, and rewrite
+                // the interrupt frame so the iretq jumps into the new program
+                // on a fresh user stack (this process image is replaced).
+                crate::klog!("[syscall] EXEC called, path ptr={:#x}\n", a);
+                let Some(path) = read_user_path(a) else {
+                    crate::klog!("[syscall] exec: bad path ptr\n");
+                    return u64::MAX;
+                };
+                crate::klog!("[syscall] exec path={}\n", path);
+                let elf = crate::fs::with(|vfs| vfs.read_file(&path));
+                let Some(elf) = elf else {
+                    crate::klog!("[syscall] exec: {} not found\n", path);
+                    return u64::MAX;
+                };
+                match super::load_elf_into_user(&elf) {
+                    Ok((entry, stack_top)) => {
+                        crate::klog!("[syscall] exec: {} -> entry {:#x}\n", path, entry);
+                        let mut fv = unsafe { stack.as_mut().read() };
+                        fv.instruction_pointer = VirtAddr::new(entry);
+                        fv.stack_pointer = VirtAddr::new(stack_top);
+                        // CS/SS already point at user segments from this int 0x80.
+                        unsafe { stack.as_mut().write(fv) };
+                        0
+                    }
+                    Err(e) => {
+                        crate::klog!("[syscall] exec: {}\n", e);
+                        u64::MAX
+                    }
+                }
+            }
+            SYS_WAIT => {
+                // a = pid to wait for. No fork yet, so we just yield once;
+                // the child will have exited by the time we get scheduled again.
+                let _ = a;
+                crate::task::yield_now();
                 0
             }
             _ => {

@@ -90,3 +90,21 @@ pub fn user_data() -> SegmentSelector {
 pub fn user_code() -> SegmentSelector {
     GDT.1.user_code_selector
 }
+
+/// The kernel stack (RSP0) the CPU switches to when a Ring-3 program traps
+/// into the kernel. Currently the single shared privilege stack; user
+/// processes get their own stack set per-process via [`set_priv_stack`].
+pub fn priv_stack_top() -> u64 {
+    TSS.privilege_stack_table[0].as_u64()
+}
+
+/// Point the TSS RSP0 at a per-process kernel stack. The CPU reads this from
+/// the TSS on every user->kernel privilege transition, so each user process
+/// must run with its own kernel stack to avoid clobbering a suspended one.
+/// Called from the scheduler with interrupts off on a single CPU.
+pub fn set_priv_stack(top: u64) {
+    unsafe {
+        let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+        (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(top);
+    }
+}

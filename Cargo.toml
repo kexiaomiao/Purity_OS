@@ -2,5 +2,17 @@
 members = ["kernel", "xtask"]
 resolver = "2"
 
+# Profiles live at the workspace root so they apply to the no_std kernel
+# member. `panic = "abort"` is mandatory for a freestanding kernel: unwinding
+# is unsupported without std.
+[profile.dev]
+panic = "abort"
+# Less optimization => faster kernel builds.
+debug-assertions = true
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
 # Convenience: `cargo run --bin xtask -- build` builds the kernel and packs
 # it into a bootable disk image. See xtask/README or the top-level README.

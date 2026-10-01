@@ -49,4 +49,38 @@ fn main() {
     // Rebuild when the user program changes.
     println!("cargo:rerun-if-changed={}", c_src.display());
     println!("cargo:rerun-if-changed={}", ld_script.display());
+
+    // 3) Compile the user shell the same way into user_shell.elf.
+    let sh_src = src_dir.join("userspace/shell.c");
+    let sh_obj = out.join("user_shell.o");
+    let sh_elf = out.join("user_shell.elf");
+    let status = Command::new("cc")
+        .arg("-c").arg("-ffreestanding").arg("-fno-stack-protector")
+        .arg("-fno-pic").arg("-mno-red-zone").arg("-mcmodel=large").arg("-O1")
+        .arg("-o").arg(&sh_obj).arg(&sh_src)
+        .status().expect("failed to invoke cc");
+    assert!(status.success(), "compiling userspace/shell.c failed");
+    let status = Command::new("cc")
+        .arg("-nostdlib").arg("-no-pie").arg("-T").arg(&ld_script)
+        .arg("-o").arg(&sh_elf).arg(&sh_obj)
+        .status().expect("failed to invoke linker");
+    assert!(status.success(), "linking user_shell.elf failed");
+    println!("cargo:rerun-if-changed={}", sh_src.display());
+
+    // 4) Compile the fork test into user_forktest.elf.
+    let ft_src = src_dir.join("userspace/forktest.c");
+    let ft_obj = out.join("user_forktest.o");
+    let ft_elf = out.join("user_forktest.elf");
+    let status = Command::new("cc")
+        .arg("-c").arg("-ffreestanding").arg("-fno-stack-protector")
+        .arg("-fno-pic").arg("-mno-red-zone").arg("-mcmodel=large").arg("-O1")
+        .arg("-o").arg(&ft_obj).arg(&ft_src)
+        .status().expect("failed to invoke cc");
+    assert!(status.success(), "compiling userspace/forktest.c failed");
+    let status = Command::new("cc")
+        .arg("-nostdlib").arg("-no-pie").arg("-T").arg(&ld_script)
+        .arg("-o").arg(&ft_elf).arg(&ft_obj)
+        .status().expect("failed to invoke linker");
+    assert!(status.success(), "linking user_forktest.elf failed");
+    println!("cargo:rerun-if-changed={}", ft_src.display());
 }

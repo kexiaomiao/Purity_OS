@@ -35,10 +35,10 @@ void _start(void)
     const char *b = "[user] I am running in user mode, pid-less, but alive.\n";
     const char *c = "[user] slept for 1.5 s via SYS_SLEEP, still alive.\n";
     const char *d = "[user] exiting back to the kernel...\n";
-    sys_write(a, sizeof(a) - 1);
-    sys_write(b, sizeof(b) - 1);
+    sys_write(a, 28);
+    sys_write(b, 55);
     sys_sleep(1500);
-    sys_write(c, sizeof(c) - 1);
-    sys_write(d, sizeof(d) - 1);
+    sys_write(c, 51);
+    sys_write(d, 36);
     sys_exit(0);
 }
